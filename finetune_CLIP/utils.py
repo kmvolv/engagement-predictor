@@ -1,10 +1,12 @@
 import torch.nn as nn
 from PIL import Image
 import torch
+import numpy as np
 from transformers import CLIPModel, BertModel
 from torchvision import models
 from torch.utils.data import Dataset
 from alive_progress import alive_bar
+from sklearn.preprocessing import StandardScaler
 
 NUM_ENGAGEMENT_METRICS = 3
 new_cache_dir = "/work/classtmp/dhawal04/.cache/torch"
@@ -29,8 +31,15 @@ class PixelRecDataset(Dataset):
        
         # Combine text fields
         text = f"Title: {item['title']} Tag: {item['tag']} Description: {item['description']}"
+        
+        # For BERT tokenizer
+        # text_encoding = self.tokenizer(text, padding='max_length',
+        #                                truncation=True, max_length=128,     # TODO: tokenizers modified according to max_length allowed, 128 for BERT, 77 for clip
+        #                                return_tensors='pt')
+        
+        # For CLIP tokenizer
         text_encoding = self.tokenizer(text, padding='max_length',
-                                       truncation=True, max_length=128,
+                                       truncation=True, max_length=77,
                                        return_tensors='pt')
        
         # Use normalizer to normalize engagement metrics
@@ -54,21 +63,15 @@ class PixelRecDataset(Dataset):
 
 
 class CLIPBasedEngagementPredictor(nn.Module):
-    """
-    Alternative approach using CLIP's multimodal capabilities directly.
-    More efficient and leverages CLIP's pre-trained vision-language alignment.
-    """
-    def __init__(self, num_engagement_metrics=NUM_ENGAGEMENT_METRICS, hidden_dim=512, dropout=0.3):
+    def __init__(self, num_engagement_metrics=NUM_ENGAGEMENT_METRICS, hidden_dim=512, dropout=0.3, normalizer = None):
         super().__init__()
         
-        # Load pre-trained CLIP
         self.clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
         
-        # Freeze CLIP parameters (optional - can unfreeze for full fine-tuning)
         for param in self.clip.parameters():
             param.requires_grad = False
         
-        clip_dim = 512  # CLIP embedding dimension
+        clip_dim = 512  
         
         # Regression head
         self.predictor = nn.Sequential(
@@ -81,24 +84,85 @@ class CLIPBasedEngagementPredictor(nn.Module):
             nn.Linear(hidden_dim // 2, num_engagement_metrics)
         )
         
+        self.normalizer = normalizer
+        
     def forward(self, images, input_ids, attention_mask):
-        # Get CLIP embeddings
         outputs = self.clip(
             pixel_values=images,
             input_ids=input_ids,
             attention_mask=attention_mask
         )
         
-        # Use multimodal embeddings (average of image and text)
         image_embeds = outputs.image_embeds
         text_embeds = outputs.text_embeds
         fused_embeds = (image_embeds + text_embeds) / 2
         
-        # Predict engagement
         predictions = self.predictor(fused_embeds)
         
         return predictions
 
+class CLIPVisionBERTTextPredictor(nn.Module):
+    def __init__(self, num_engagement_metrics=NUM_ENGAGEMENT_METRICS, hidden_dim=512, dropout=0.3, normalizer=None):
+        super().__init__()
+        
+        self.clip = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        
+        for param in self.clip.parameters():
+            param.requires_grad = False
+        
+        self.bert = BertModel.from_pretrained('bert-base-uncased')
+        
+        for param in self.bert.parameters():
+            param.requires_grad = False
+        
+        clip_vision_dim = 768  
+        bert_dim = 768  
+        
+        self.vision_projection = nn.Sequential(
+            nn.Linear(clip_vision_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.text_projection = nn.Sequential(
+            nn.Linear(bert_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout)
+        )
+        
+        self.predictor = nn.Linear(hidden_dim // 2, num_engagement_metrics)
+        
+        self.normalizer = normalizer
+        
+    def forward(self, images, input_ids, attention_mask):
+        vision_outputs = self.clip.vision_model(pixel_values=images)
+        vision_features = vision_outputs.pooler_output
+        vision_features = self.vision_projection(vision_features)
+        
+        text_outputs = self.bert(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+
+        text_features = text_outputs.last_hidden_state[:, 0, :]
+        text_features = self.text_projection(text_features)
+        
+
+        fused_features = torch.cat([vision_features, text_features], dim=1)
+        fused_features = self.fusion(fused_features)
+        
+        predictions = self.predictor(fused_features)
+        
+        return predictions
 
 
 class MultimodalEngagementPredictor(nn.Module):
@@ -166,6 +230,38 @@ class MultimodalEngagementPredictor(nn.Module):
         
         return predictions
     
+
+class EngagementNormalizer:
+    """Normalize engagement metrics for better training"""
+    def __init__(self):
+        self.scaler = StandardScaler()
+        
+    def fit(self, engagement_data):
+        """Fit on training data"""
+        engagement_array = np.array([[
+            e['likes']
+            , e['comments']
+            #, e['shares'] 
+            , e['views'] 
+            #, e['favorites']
+        ] for e in engagement_data])
+        self.scaler.fit(engagement_array)
+        
+    def transform(self, engagement):
+        """Transform engagement dict to normalized array"""
+        arr = np.array([[
+            engagement['likes']
+            , engagement['comments']
+            # , engagement['shares'] 
+            , engagement['views']
+            # , engagement['favorites']
+        ]])
+        return self.scaler.transform(arr)[0]
+    
+    def inverse_transform(self, normalized_engagement):
+        """Convert normalized predictions back to original scale"""
+        return self.scaler.inverse_transform(normalized_engagement)
+    
 def train_epoch(model, dataloader, optimizer, criterion, device):
     model.train()
     total_loss = 0
@@ -230,4 +326,8 @@ def evaluate(model, dataloader, criterion, device):
     all_predictions = torch.cat(all_predictions)
     all_targets = torch.cat(all_targets)
     
+    if model.normalizer:
+        all_predictions = torch.tensor(model.normalizer.inverse_transform(all_predictions.numpy()))
+        all_targets = torch.tensor(model.normalizer.inverse_transform(all_targets.numpy()))
+
     return total_loss / len(dataloader), all_predictions, all_targets

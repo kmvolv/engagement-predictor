@@ -22,4 +22,4 @@ source "/work/classtmp/dhawal04/.venv/bin/activate"
 BASE="/work/classtmp/dhawal04/Advance AI/engagement-predictor/finetune_CLIP"
 cd "$BASE/"
 
-python finetune_these_nuts.py
+python finetuner.py
