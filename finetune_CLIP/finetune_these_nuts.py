@@ -98,9 +98,34 @@ def train_engagement_model(
     
     # Initialize model
     model = MultimodalEngagementPredictor().to(device)
+
+    class ToleranceMSE(nn.Module):
+        def __init__(self, tolerance=0.01, reduction='mean', eps=1e-8):
+            super().__init__()
+            self.tolerance = tolerance
+            self.reduction = reduction
+            self.eps = eps
+            self.last_accuracy = 0.0
+
+        def forward(self, preds, targets):
+            rel_err = torch.abs(preds - targets) / (torch.abs(targets) + self.eps)
+            with torch.no_grad():
+                correct = (rel_err <= self.tolerance).float()
+                self.last_accuracy = correct.mean().item()
+            mask = (rel_err > self.tolerance).float()
+            se = (preds - targets) ** 2
+            masked_se = se * mask
+            if self.reduction == 'mean':
+                return masked_se.mean()
+            elif self.reduction == 'sum':
+                return masked_se.sum()
+            else:
+                return masked_se
+
+    criterion = ToleranceMSE(tolerance=0.10, reduction='mean')
     
     # Loss function (MSE for regression)
-    criterion = nn.MSELoss()
+    # criterion = nn.MSELoss()
     
     # Optimizer
     optimizer = optim.AdamW(model.parameters(), lr=learning_rate, 
