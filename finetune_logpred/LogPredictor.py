@@ -799,7 +799,7 @@ print("EVALUATING ON TEST SET")
 print("="*80 + "\n")
 
 # Load best model
-checkpoint = torch.load(Path(CONFIG['checkpoint_dir']) / 'best_model_enhanced.pth')
+checkpoint = torch.load(Path(CONFIG['checkpoint_dir']) / 'best_model_enhanced.pth', weights_only=False)
 model.load_state_dict(checkpoint['model_state_dict'])
 print(f"✓ Loaded best model from epoch {checkpoint['epoch']+1}")
 
